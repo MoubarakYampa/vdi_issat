@@ -1,0 +1,10 @@
+services:
+  issatmh-desktop:
+    build: .
+    container_name: issatmh-desktop
+    restart: unless-stopped
+    ports:
+      - "6901:6901"
+    shm_size: "512mb"
+    security_opt:
+      - seccomp:unconfined
