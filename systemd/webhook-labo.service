@@ -1,0 +1,12 @@
+[Unit]
+Description=Webhook Receiver Labo Kasm
+After=network.target
+
+[Service]
+User=docker
+WorkingDirectory=/home/docker/authentik
+ExecStart=/usr/bin/python3 /home/docker/authentik/webhook_receiver.py
+Restart=always
+
+[Install]
+WantedBy=multi-user.target

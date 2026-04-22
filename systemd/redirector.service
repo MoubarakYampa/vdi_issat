@@ -1,0 +1,12 @@
+[Unit]
+Description=Redirector Kasm
+After=network.target
+
+[Service]
+User=docker
+WorkingDirectory=/home/docker/authentik
+ExecStart=/usr/bin/python3 /home/docker/authentik/redirector.py
+Restart=always
+
+[Install]
+WantedBy=multi-user.target

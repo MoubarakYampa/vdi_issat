@@ -1,174 +1,173 @@
-#!/usr/bin/env python3
-"""
-redirector.py — Service Flask de redirection VDI
-Port : 8080
-
-Rôle :
-  - /bureau    : redirige l'étudiant authentifié vers son container noVNC
-  - /auth-kasm : endpoint de vérification pour le auth_request de Nginx
-  - /status    : monitoring des containers actifs
-
-Dépendances :
-  pip install flask requests docker
-"""
-
-from flask import Flask, request, redirect, jsonify, abort
-import requests
+from flask import Flask, redirect, jsonify, request
 import docker
-import logging
-
-# ─── Configuration ────────────────────────────────────────────────────────────
-AUTHENTIK_URL = "http://192.168.1.3:9000"
-BASE_URL = "http://labo.issat.local"
-VDI_PORT = 8080
-
-logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-log = logging.getLogger(__name__)
+import requests as req
+import subprocess
+import time
+import os
 
 app = Flask(__name__)
-docker_client = docker.from_env()
+docker_cli = docker.from_env()
 
-# ─── Fonctions utilitaires ────────────────────────────────────────────────────
+AUTHENTIK_URL = "http://127.0.0.1:9000"
+LANCER_SCRIPT = "/home/docker/authentik/lancer_kasm.sh"
+ANNEE_UNIV    = "25-26"
 
-def get_username_from_session(session_cookie: str) -> str | None:
-    """Interroge l'API Authentik pour obtenir le username depuis le cookie de session."""
+
+def get_user_from_session(session_cookie):
     try:
-        response = requests.get(
+        response = req.get(
             f"{AUTHENTIK_URL}/api/v3/core/users/me/",
             cookies={"authentik_session": session_cookie},
             timeout=5
         )
         if response.status_code == 200:
-            data = response.json()
-            return data.get("user", {}).get("username")
-    except requests.RequestException as e:
-        log.error(f"Erreur API Authentik : {e}")
-    return None
-
-
-def get_container_port(username: str) -> str | None:
-    """Récupère le port hôte du container kasm-<username> via le SDK Docker."""
-    try:
-        container = docker_client.containers.get(f"kasm-{username}")
-        ports = container.ports.get("6901/tcp")
-        if ports:
-            return ports[0]["HostPort"]
-    except docker.errors.NotFound:
-        log.warning(f"Container kasm-{username} introuvable")
+            data  = response.json()
+            user  = data.get("user") or data
+            attrs = user.get("attributes") or {}
+            return {
+                "username":    user.get("username", ""),
+                "groups":      ",".join([g.get("name", "") for g in user.get("groups_obj", [])]),
+                "annee_univ":  attrs.get("annee_univ", ANNEE_UNIV),
+                "niveau":      attrs.get("niveau", ""),
+                "sous_groupe": attrs.get("sous_groupe", ""),
+            }
     except Exception as e:
-        log.error(f"Erreur Docker : {e}")
+        print(f"Erreur API Authentik: {e}")
     return None
 
-# ─── Endpoints ────────────────────────────────────────────────────────────────
+
+def get_active_container(username, tp_name=None):
+    try:
+        containers = docker_cli.containers.list(
+            filters={"name": username, "status": "running"}
+        )
+        for c in containers:
+            parts = c.name.split("-")
+            if username in parts:
+                if tp_name is None or c.name.startswith(tp_name + "-"):
+                    return c
+    except Exception as e:
+        print(f"Erreur Docker: {e}")
+    return None
+
+
+def container_url(container_name):
+    return (
+        f"/kasm/{container_name}/vnc_auto.html"
+        f"?autoconnect=true&reconnect=true&reconnect_delay=1000"
+        f"&resize=scale&quality=6&path=kasm/{container_name}/websockify"
+    )
+
 
 @app.route("/auth-kasm")
 def auth_kasm():
-    """
-    Endpoint de vérification pour Nginx auth_request.
-    Vérifie que l'utilisateur connecté est bien le propriétaire du bureau demandé.
-
-    Retours :
-        200  → accès autorisé
-        401  → non authentifié (pas de cookie de session valide)
-        403  → accès refusé (mauvais utilisateur)
-    """
     session_cookie = request.cookies.get("authentik_session")
     if not session_cookie:
-        log.info("auth-kasm : pas de cookie de session → 401")
         return "", 401
 
-    username = get_username_from_session(session_cookie)
-    if not username:
-        log.info("auth-kasm : session invalide → 401")
+    info = get_user_from_session(session_cookie)
+    if not info:
         return "", 401
 
-    # Extraire le username cible depuis l'URL originale (/kasm/<user>/...)
+    username = info["username"]
     original_uri = request.headers.get("X-Original-URI", "")
     parts = original_uri.strip("/").split("/")
-    # Format attendu : /kasm/<username>/...
+
     if len(parts) >= 2 and parts[0] == "kasm":
-        kasm_user = parts[1]
-        if kasm_user != username:
-            log.warning(f"auth-kasm : {username} tente d'accéder au bureau de {kasm_user} → 403")
+        container_name = parts[1]
+        name_parts = container_name.split("-")
+        if username not in name_parts:
+            print(f"[BLOCKED] {username} -> {container_name}")
             return "", 403
 
-    log.info(f"auth-kasm : accès autorisé pour {username}")
     return "", 200
 
 
-@app.route("/bureau")
-@app.route("/")
-def bureau():
+@app.route("/lancer-tp/<tp_name>")
+def lancer_tp(tp_name):
     """
-    Redirige l'étudiant authentifié vers son bureau noVNC.
-    Si le container est introuvable, retourne une erreur 503.
+    Déclenché quand l'étudiant clique sur une application dans le portail Authentik.
+    Chaque application Authentik pointe vers /lancer-tp/<nom_du_tp>.
     """
     session_cookie = request.cookies.get("authentik_session")
     if not session_cookie:
-        log.info("bureau : pas de cookie → redirection vers login")
-        return redirect(f"{AUTHENTIK_URL}/")
+        return redirect("http://labo.issat.local")
 
-    username = get_username_from_session(session_cookie)
-    if not username:
-        log.info("bureau : session invalide → redirection vers login")
-        return redirect(f"{AUTHENTIK_URL}/")
+    info = get_user_from_session(session_cookie)
+    if not info:
+        return redirect("http://labo.issat.local")
 
-    port = get_container_port(username)
-    if not port:
-        log.error(f"bureau : container de {username} introuvable ou non démarré")
-        return f"""
-        <html><body style="font-family:sans-serif;text-align:center;padding:50px">
-        <h2>Bureau non disponible</h2>
-        <p>Votre bureau VDI n'est pas encore prêt. Veuillez patienter quelques secondes et rafraîchir.</p>
-        <p><a href="/bureau">Réessayer</a></p>
-        </body></html>
-        """, 503
+    username    = info["username"]
+    groups      = info["groups"]
+    annee_univ  = info["annee_univ"]
+    niveau      = info["niveau"]
+    sous_groupe = info["sous_groupe"]
 
-    novnc_url = (
-        f"/kasm/{username}/vnc_auto.html"
-        f"?autoconnect=true"
-        f"&reconnect=true"
-        f"&reconnect_delay=1000"
-        f"&resize=scale"
-        f"&quality=6"
-        f"&path=kasm/{username}/websockify"
+    container_name = f"{tp_name}-{username}-{annee_univ}"
+    active = get_active_container(username, tp_name)
+
+    if active:
+        print(f"[ALREADY RUNNING] {username} -> {active.name}")
+        return redirect(container_url(active.name))
+
+    print(f"[LAUNCH] {username} -> {container_name} (niveau={niveau}, sg={sous_groupe})")
+
+    result = subprocess.run(
+        ["sudo", "-n", "bash", LANCER_SCRIPT,
+         username, groups, tp_name, annee_univ, niveau, sous_groupe],
+        capture_output=True, text=True, timeout=60
     )
 
-    log.info(f"bureau : redirection de {username} → port {port}")
-    return redirect(novnc_url)
+    if result.returncode != 0:
+        return f"<h2>Erreur lancement TP {tp_name}</h2><pre>{result.stderr}</pre>", 500
+
+    time.sleep(4)
+    return redirect(container_url(container_name))
+
+
+@app.route("/bureau")
+def redirect_to_kasm():
+    session_cookie = request.cookies.get("authentik_session")
+    if not session_cookie:
+        return redirect("http://labo.issat.local")
+
+    info = get_user_from_session(session_cookie)
+    if not info:
+        return redirect("http://labo.issat.local")
+
+    username = info["username"]
+    active = get_active_container(username)
+
+    if not active:
+        return jsonify({
+            "erreur": f"Aucun TP actif pour {username}",
+            "solution": "Retournez sur le portail et choisissez un TP."
+        }), 404
+
+    return redirect(container_url(active.name))
 
 
 @app.route("/status")
 def status():
-    """
-    Retourne l'état de tous les containers kasm-* actifs.
-    À restreindre au réseau interne via Nginx en production.
-    """
-    containers = []
-    try:
-        for container in docker_client.containers.list():
-            if container.name.startswith("kasm-"):
-                username = container.name[len("kasm-"):]
-                ports = container.ports.get("6901/tcp")
-                port = ports[0]["HostPort"] if ports else None
-                containers.append({
-                    "utilisateur": username,
-                    "container": container.name,
-                    "port": port,
-                    "url": f"{BASE_URL}/kasm/{username}/",
-                    "statut": container.status
-                })
-    except Exception as e:
-        log.error(f"status : erreur Docker : {e}")
+    result = []
+    for c in docker_cli.containers.list():
+        labels   = c.labels or {}
+        bindings = c.ports.get("6901/tcp")
+        port     = bindings[0]["HostPort"] if bindings else "inconnu"
 
-    return jsonify({
-        "redirecteur": "actif",
-        "total": len(containers),
-        "containers": containers
-    })
+        result.append({
+            "container":  c.name,
+            "etudiant":   labels.get("etudiant", ""),
+            "tp":         labels.get("tp", ""),
+            "groupe":     labels.get("groupe", ""),
+            "annee_univ": labels.get("annee_univ", ""),
+            "port":       port,
+            "url":        f"http://labo.issat.local/kasm/{c.name}/",
+            "statut":     c.status
+        })
+
+    return jsonify({"redirecteur": "actif", "total": len(result), "containers": result})
 
 
-# ─── Point d'entrée ───────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    log.info(f"Démarrage du redirecteur VDI sur le port {VDI_PORT}")
-    app.run(host="0.0.0.0", port=VDI_PORT, debug=False)
+    app.run(host="0.0.0.0", port=8080)

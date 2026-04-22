@@ -1,145 +1,111 @@
-#!/usr/bin/env python3
-"""
-webhook_receiver.py — Récepteur de webhooks Authentik
-Port : 9001
-
-Rôle :
-  Écoute les événements envoyés par Authentik (login / logout)
-  et déclenche les scripts de gestion des containers VDI.
-
-Format JSON attendu :
-  {
-    "user": {"username": "malek"},
-    "action": "login"
-  }
-
-Dépendances :
-  pip install flask
-"""
-
 from flask import Flask, request, jsonify
 import subprocess
 import logging
 import os
+import json
 
-# ─── Configuration ────────────────────────────────────────────────────────────
-WEBHOOK_PORT = 9001
-SCRIPTS_DIR = "/home/docker/authentik"
-LANCER_SCRIPT = os.path.join(SCRIPTS_DIR, "lancer_kasm.sh")
+WEBHOOK_PORT   = 9001
+SCRIPTS_DIR    = "/home/docker/authentik"
+LANCER_SCRIPT  = os.path.join(SCRIPTS_DIR, "lancer_kasm.sh")
 STOPPER_SCRIPT = os.path.join(SCRIPTS_DIR, "stopper_kasm.sh")
+
+# Actions qui déclenchent le lancement d'un container
+# Note : le login automatique n'est plus utilisé — le lancement se fait
+# désormais manuellement via les applications du portail Authentik (/lancer-tp/<tp>)
+LAUNCH_ACTIONS = {"launch_tp", "custom_notification_test"}
+DEFAULT_TP = "desktop"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-# ─── Fonctions utilitaires ────────────────────────────────────────────────────
 
-def run_script(script: str, username: str) -> tuple[bool, str]:
-    """Exécute un script bash avec sudo et retourne (succès, sortie)."""
+def run_script(script, *args):
     try:
-        result = subprocess.run(
-            ["sudo", "-n", "bash", script, username],
-            capture_output=True,
-            text=True,
-            timeout=60
-        )
+        cmd = ["sudo", "-n", "bash", script] + [str(a) for a in args]
+        result = subprocess.run(cmd, capture_output=True, text=True, timeout=60)
         output = result.stdout + result.stderr
         if result.returncode == 0:
-            log.info(f"Script {os.path.basename(script)} OK pour {username}\n{output}")
+            log.info(f"Script OK: {output.strip()}")
             return True, output
-        else:
-            log.error(f"Script {os.path.basename(script)} ÉCHEC pour {username}\n{output}")
-            return False, output
+        log.error(f"Script ECHEC (code={result.returncode}): {output}")
+        return False, output
     except subprocess.TimeoutExpired:
-        log.error(f"Script {os.path.basename(script)} TIMEOUT pour {username}")
-        return False, "Timeout dépassé"
+        log.error("Script timeout (>60s)")
+        return False, "timeout"
     except Exception as e:
-        log.error(f"Erreur d'exécution du script : {e}")
+        log.exception(f"Erreur script: {e}")
         return False, str(e)
 
-# ─── Endpoint ─────────────────────────────────────────────────────────────────
+
+def extract_payload(data):
+    user  = data.get("user") or {}
+    attrs = user.get("attributes") or {}
+
+    return {
+        "action":      str(data.get("action") or "").strip(),
+        "tp":          str(data.get("tp") or DEFAULT_TP).strip(),
+        "username":    str(user.get("username") or "").strip(),
+        "groups":      str(user.get("groups") or "").strip(),
+        "annee_univ":  str(attrs.get("annee_univ")  or "25-26").strip(),
+        "niveau":      str(attrs.get("niveau")      or "").strip(),
+        "sous_groupe": str(attrs.get("sous_groupe") or "").strip(),
+    }
+
 
 @app.route("/webhook", methods=["POST"])
 def webhook():
-    """
-    Reçoit les webhooks d'Authentik et déclenche les scripts correspondants.
+    raw_body = request.get_data(as_text=True)
 
-    Actions gérées :
-      - login                    → lancer_kasm.sh <username>
-      - logout                   → stopper_kasm.sh <username>
-      - custom_notification_test → lancer_kasm.sh <username> (pour tests)
-    """
-    # Vérifier le Content-Type
-    if not request.is_json:
-        log.warning("Webhook reçu sans Content-Type application/json")
-        return jsonify({"error": "Content-Type must be application/json"}), 400
+    try:
+        data = json.loads(raw_body) if raw_body else {}
+    except Exception as e:
+        log.error(f"JSON invalide: {e} | body={raw_body[:200]}")
+        return jsonify({"error": "JSON invalide"}), 400
 
-    data = request.get_json(silent=True)
     if not data:
-        log.warning("Webhook reçu avec un JSON invalide")
-        return jsonify({"error": "JSON invalide ou vide"}), 400
+        log.warning("Payload vide recu")
+        return jsonify({"error": "payload vide"}), 400
 
-    # Extraire les champs
-    user_info = data.get("user", {})
-    username = user_info.get("username", "").strip()
-    action = data.get("action", "").strip()
+    p = extract_payload(data)
 
-    if not username:
-        log.warning(f"Webhook reçu sans username : {data}")
+    if not p["username"]:
+        log.warning(f"username manquant | keys={list(data.keys())}")
         return jsonify({"error": "username manquant"}), 400
 
-    log.info(f"Webhook reçu — action: '{action}', utilisateur: '{username}'")
+    log.info(
+        f"Webhook action='{p['action']}' user='{p['username']}' "
+        f"tp='{p['tp']}' groupes='{p['groups']}'"
+    )
 
-    # ─── Dispatch selon l'action ──────────────────────────────────────────────
-    if action in ("login", "custom_notification_test"):
-        success, output = run_script(LANCER_SCRIPT, username)
-        if success:
-            return jsonify({
-                "status": "started",
-                "user": username,
-                "action": action
-            }), 200
-        else:
-            return jsonify({
-                "status": "error",
-                "user": username,
-                "action": action,
-                "detail": output
-            }), 500
-
-    elif action == "logout":
-        success, output = run_script(STOPPER_SCRIPT, username)
-        if success:
-            return jsonify({
-                "status": "stopped",
-                "user": username,
-                "action": action
-            }), 200
-        else:
-            return jsonify({
-                "status": "error",
-                "user": username,
-                "action": action,
-                "detail": output
-            }), 500
-
-    else:
-        log.info(f"Action '{action}' ignorée pour {username}")
+    if p["action"] in LAUNCH_ACTIONS:
+        success, _ = run_script(
+            LANCER_SCRIPT,
+            p["username"], p["groups"], p["tp"],
+            p["annee_univ"], p["niveau"], p["sous_groupe"],
+        )
         return jsonify({
-            "status": "ignored",
-            "user": username,
-            "action": action
-        }), 200
+            "status":    "started" if success else "error",
+            "user":      p["username"],
+            "tp":        p["tp"],
+            "container": f"{p['tp']}-{p['username']}-{p['annee_univ']}",
+        }), (200 if success else 500)
+
+    if p["action"] == "logout":
+        success, _ = run_script(STOPPER_SCRIPT, p["username"])
+        return jsonify({
+            "status": "stopped" if success else "error",
+            "user": p["username"]
+        }), (200 if success else 500)
+
+    return jsonify({"status": "ignored", "action": p["action"]}), 200
 
 
 @app.route("/health")
 def health():
-    """Endpoint de contrôle de santé."""
-    return jsonify({"status": "ok", "service": "webhook-receiver"}), 200
+    return jsonify({"status": "ok"}), 200
 
 
-# ─── Point d'entrée ───────────────────────────────────────────────────────────
 if __name__ == "__main__":
-    log.info(f"Démarrage du webhook receiver sur le port {WEBHOOK_PORT}")
     app.run(host="0.0.0.0", port=WEBHOOK_PORT, debug=False)
